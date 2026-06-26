@@ -895,8 +895,15 @@ async function loginSuccess(user,skipTrack){
   const empName=user.role==='employee'?user.emp.name:(user.mgrName||'HR Admin');
   const now=new Date();
   const timeStr=now.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true});
-  if(!skipTrack)fetch(window.location.origin+'/api/track-login',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({empId:user.emp?user.emp.id:'HRADMIN',empName,role:user.role,time:timeStr})}).catch(()=>{});
+  if(!skipTrack){
+    const loginPayload={empId:user.emp?user.emp.id:'HRADMIN',empName,role:user.role,time:timeStr};
+    (function trackWithRetry(attempts){
+      fetch(window.location.origin+'/api/track-login',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(loginPayload)})
+      .then(r=>r.json()).then(r=>{if(!r.ok&&attempts<3)setTimeout(()=>trackWithRetry(attempts+1),3000);})
+      .catch(()=>{if(attempts<3)setTimeout(()=>trackWithRetry(attempts+1),3000);});
+    })(0);
+  }
   document.getElementById('loginPage').style.display='none';
   const app=document.getElementById('app');
   app.classList.add('on');

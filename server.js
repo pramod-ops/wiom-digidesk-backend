@@ -289,8 +289,8 @@ app.post('/api/track-login', async (req, res) => {
   logins.unshift({ empId, empName, role, time, date: new Date().toISOString().split('T')[0] });
   if (logins.length > 1000) logins.splice(1000); // keep last 1000
   data.wiom_logins = JSON.stringify(logins);
-  writeData(data);
-  res.json({ ok: true });
+  const ok = await writeData(data);
+  res.json({ ok });
 });
 
 // ==================== MANUAL TRIGGER ====================

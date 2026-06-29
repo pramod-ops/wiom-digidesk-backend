@@ -63,6 +63,7 @@ let _writeQueue = Promise.resolve();
 async function writeData(data) {
   const snapshot = JSON.parse(JSON.stringify(data));
   _memCache = snapshot;
+  _memCacheTime = Date.now();
   let resolveResult;
   const result = new Promise(res => { resolveResult = res; });
 
@@ -290,17 +291,16 @@ async function sendDailyAttendance() {
 app.post('/api/track-login', async (req, res) => {
   const { empId, empName, role, time } = req.body;
   if (!empId) return res.json({ ok: true });
-  let saved = false;
   _opQueue = _opQueue.then(async () => {
     const data = await readData();
     const logins = data.wiom_logins ? JSON.parse(data.wiom_logins) : [];
     logins.unshift({ empId, empName, role, time, date: new Date().toISOString().split('T')[0] });
     if (logins.length > 1000) logins.splice(1000);
     data.wiom_logins = JSON.stringify(logins);
-    saved = await writeData(data);
+    writeData(data); // fire-and-forget: _memCache updated immediately, GitHub write in background
   }).catch(e => { console.error('track-login write error:', e?.message); });
   await _opQueue;
-  res.json({ ok: saved });
+  res.json({ ok: true });
 });
 
 // ==================== MANUAL TRIGGER ====================
@@ -310,7 +310,7 @@ app.post('/api/send-attendance-now', async (req, res) => {
 });
 
 // ==================== VERSION ====================
-app.get('/api/version', (req, res) => res.json({ version: '2.1.0', feature: 'manual-att-override' }));
+app.get('/api/version', (req, res) => res.json({ version: '2.2.0', feature: 'opqueue-fire-and-forget' }));
 
 // ==================== API ROUTES ====================
 app.get('/api', async (req, res) => {
@@ -346,10 +346,13 @@ app.post('/api/att-record', async (req, res) => {
 app.post('/api', async (req, res) => {
   const { key, value } = req.body;
   if (!key) return res.status(400).json({ ok: false });
-  const data = await readData();
-  data[key] = typeof value === 'string' ? value : JSON.stringify(value);
-  const ok = await writeData(data);
-  res.json({ ok });
+  _opQueue = _opQueue.then(async () => {
+    const data = await readData();
+    data[key] = typeof value === 'string' ? value : JSON.stringify(value);
+    writeData(data); // fire-and-forget: _memCache updated immediately, GitHub write in background
+  }).catch(e => { console.error('api write error:', e?.message); });
+  await _opQueue;
+  res.json({ ok: true });
 });
 
 app.use(express.static(path.join(__dirname, 'public')));

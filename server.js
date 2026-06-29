@@ -46,14 +46,14 @@ function ghRequest(method, path, body) {
 }
 
 async function readData() {
-  if (_memCache !== null && (Date.now() - _memCacheTime) < CACHE_TTL) return _memCache;
+  if (_memCache !== null && (Date.now() - _memCacheTime) < CACHE_TTL) return JSON.parse(JSON.stringify(_memCache));
   try {
     const r = await ghRequest('GET', `/repos/${GH_REPO}/contents/${GH_FILE}`);
-    if (r.content) { _memSha = r.sha; _memCache = JSON.parse(Buffer.from(r.content, 'base64').toString('utf8')); _memCacheTime = Date.now(); return _memCache; }
+    if (r.content) { _memSha = r.sha; _memCache = JSON.parse(Buffer.from(r.content, 'base64').toString('utf8')); _memCacheTime = Date.now(); return JSON.parse(JSON.stringify(_memCache)); }
   } catch (e) {}
-  if (_memCache !== null) return _memCache; // fallback to stale cache on error
+  if (_memCache !== null) return JSON.parse(JSON.stringify(_memCache));
   _memCache = {};
-  return _memCache;
+  return {};
 }
 
 let _writeQueue = Promise.resolve();
@@ -61,7 +61,8 @@ let _writeQueue = Promise.resolve();
 // writeData returns true if GitHub confirmed the write, false if all retries failed.
 // _writeQueue never rejects (poisoning prevented via .catch).
 async function writeData(data) {
-  _memCache = data;
+  const snapshot = JSON.parse(JSON.stringify(data));
+  _memCache = snapshot;
   let resolveResult;
   const result = new Promise(res => { resolveResult = res; });
 
@@ -71,7 +72,7 @@ async function writeData(data) {
         const cur = await ghRequest('GET', `/repos/${GH_REPO}/contents/${GH_FILE}`);
         if (cur.sha) _memSha = cur.sha;
       } catch (e) {}
-      const content = Buffer.from(JSON.stringify(_memCache)).toString('base64');
+      const content = Buffer.from(JSON.stringify(snapshot)).toString('base64');
       const body = { message: 'update data', content };
       if (_memSha) body.sha = _memSha;
       try {
@@ -176,24 +177,29 @@ app.post('/slack/actions', async (req, res) => {
 
   res.send(''); // Respond immediately to Slack
 
-  // Update leave in data
-  const data = await readData();
-  const leaves = data.wiom_leaves ? JSON.parse(data.wiom_leaves) : [];
-  const leaveIdx = leaves.findIndex(l => l.id === leaveId);
+  // Update leave in data — through _opQueue so it never races with attendance writes
+  let leaveNotFound = false;
+  let leave, approved;
+  _opQueue = _opQueue.then(async () => {
+    const data = await readData();
+    const leaves = data.wiom_leaves ? JSON.parse(data.wiom_leaves) : [];
+    const leaveIdx = leaves.findIndex(l => l.id === leaveId);
+    if (leaveIdx === -1) { leaveNotFound = true; return; }
+    leave = leaves[leaveIdx];
+    approved = actionId === 'approve_leave';
+    leave.status = approved ? 'Approved' : 'Rejected';
+    leave.approvedBy = mgrName;
+    leave.approvedAt = new Date().toISOString();
+    data.wiom_leaves = JSON.stringify(leaves);
+    const writeOk = await writeData(data);
+    if (!writeOk) console.error('CRITICAL: Slack leave action write failed for', leaveId);
+  }).catch(e => { console.error('slack/actions write error:', e?.message); });
+  await _opQueue;
 
-  if (leaveIdx === -1) {
+  if (leaveNotFound) {
     await slackAPI('chat.postMessage', { channel, text: ':warning: Leave request not found. It may have already been processed.' });
     return;
   }
-
-  const leave = leaves[leaveIdx];
-  const approved = actionId === 'approve_leave';
-  leave.status = approved ? 'Approved' : 'Rejected';
-  leave.approvedBy = mgrName;
-  leave.approvedAt = new Date().toISOString();
-
-  data.wiom_leaves = JSON.stringify(leaves);
-  await writeData(data);
 
   // Update the Slack message to show decision
   const decisionText = approved
@@ -284,13 +290,17 @@ async function sendDailyAttendance() {
 app.post('/api/track-login', async (req, res) => {
   const { empId, empName, role, time } = req.body;
   if (!empId) return res.json({ ok: true });
-  const data = await readData();
-  const logins = data.wiom_logins ? JSON.parse(data.wiom_logins) : [];
-  logins.unshift({ empId, empName, role, time, date: new Date().toISOString().split('T')[0] });
-  if (logins.length > 1000) logins.splice(1000); // keep last 1000
-  data.wiom_logins = JSON.stringify(logins);
-  const ok = await writeData(data);
-  res.json({ ok });
+  let saved = false;
+  _opQueue = _opQueue.then(async () => {
+    const data = await readData();
+    const logins = data.wiom_logins ? JSON.parse(data.wiom_logins) : [];
+    logins.unshift({ empId, empName, role, time, date: new Date().toISOString().split('T')[0] });
+    if (logins.length > 1000) logins.splice(1000);
+    data.wiom_logins = JSON.stringify(logins);
+    saved = await writeData(data);
+  }).catch(e => { console.error('track-login write error:', e?.message); });
+  await _opQueue;
+  res.json({ ok: saved });
 });
 
 // ==================== MANUAL TRIGGER ====================
@@ -319,7 +329,11 @@ app.post('/api/att-record', async (req, res) => {
   _opQueue = _opQueue.then(async () => {
     const data = await readData();
     const att = data.wiom_att ? JSON.parse(data.wiom_att) : {};
-    att[attKey] = attValue;
+    if (attValue === null || attValue === undefined) {
+      delete att[attKey];
+    } else {
+      att[attKey] = { ...(att[attKey] || {}), ...attValue };
+    }
     data.wiom_att = JSON.stringify(att);
     saved = await writeData(data); // true only if GitHub confirmed
   }).catch(e => {
@@ -333,7 +347,7 @@ app.post('/api', async (req, res) => {
   const { key, value } = req.body;
   if (!key) return res.status(400).json({ ok: false });
   const data = await readData();
-  data[key] = value;
+  data[key] = typeof value === 'string' ? value : JSON.stringify(value);
   const ok = await writeData(data);
   res.json({ ok });
 });
@@ -349,6 +363,7 @@ app.listen(PORT, () => {
 // Graceful shutdown — wait for any pending GitHub writes before exiting
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received — flushing pending writes...');
+  try { await _opQueue; } catch (e) {}
   try { await _writeQueue; } catch (e) {}
   console.log('Write queue flushed. Exiting.');
   process.exit(0);

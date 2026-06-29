@@ -882,6 +882,7 @@ function verifyOTP(){
 }
 
 async function loginSuccess(user,skipTrack){
+  _cacheLoaded=false;
   await loadCache();
   _attSyncAll();
   _startBgSync();
@@ -1834,7 +1835,7 @@ function downloadAttendanceCSV(scope,mgrName){
     const lwd=resign?resign.lwd:'';
     const fixedCols=[emp.id,emp.name,emp.loc||'',emp.payroll||'',emp.dept||'',emp.doj||'',emp.mobile||'',emp.status||'Active',lwd];
     const dateCols=dates.map(ds=>{
-      const dt=new Date(ds);const dow=dt.getDay();
+      const [_y,_m,_d]=ds.split('-').map(Number);const dow=new Date(_y,_m-1,_d).getDay();
       if(dow===0||dow===6)return 'WO'; // Sunday & Saturday
       if(ds>todayStr)return ''; // Future dates blank
       const onLeave=leaves.some(l=>l.empId===emp.id&&l.status==='Approved'&&ds>=l.from&&ds<=l.to);
